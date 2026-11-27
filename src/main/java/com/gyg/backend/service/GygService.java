@@ -1,0 +1,270 @@
+package com.gyg.backend.service;
+
+import com.gyg.backend.dto.*;
+import com.gyg.backend.exception.ResourceNotFoundException;
+import com.gyg.backend.exception.TooManyRequestsException;
+import com.gyg.backend.model.*;
+import com.gyg.backend.repository.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.text.Normalizer;
+import java.time.LocalDateTime;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Service
+@Transactional(readOnly = true)
+public class GygService {
+
+    private static final long CONTACT_COOLDOWN_MINUTES = 30;
+    private static final Pattern CONTACT_LINK_PATTERN = Pattern.compile("(?i)(https?://|www\\.)");
+    private static final Pattern TRACKING_CODE_PATTERN = Pattern.compile("^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{32}$");
+    private static final Pattern LEGACY_TRACKING_CODE_PATTERN = Pattern.compile("^[A-Za-z0-9-]{6,40}$");
+    private static final String DUMMY_TRACKING_HASH = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    @Autowired
+    private ObraRepository obraRepository;
+
+    @Autowired
+    private FotosObraService fotosObraService;
+
+    @Autowired
+    private DocumentosObraService documentos;
+
+    @Autowired
+    private SolicitudContactoRepository solicitudContactoRepository;
+
+    @Autowired
+    private LogChatRepository logChatRepository;
+
+    @Autowired
+    private ChatEngine chatEngine;
+
+    @Autowired
+    private TrackingCodeService trackingCodeService;
+
+    @Autowired
+    private EmailSubmissionLockService emailSubmissionLockService;
+
+    @Value("${app.privacy.policy-version:2026-01}")
+    private String policyVersion;
+
+    @Value("${app.chat.gemini.enabled:false}")
+    private boolean geminiEnabled;
+
+
+    @Value("${app.tracking-code.legacy-enabled:true}")
+    private boolean legacyTrackingCodesEnabled;
+
+    // 1. GET /api/institucional
+    public InstitucionalDTO getInstitucional() {
+        return new InstitucionalDTO(
+                "Proveer soluciones integrales de ingenieria civil y consultoria en SST con altos estandares de calidad, seguridad y sostenibilidad, aportando al desarrollo del pais y al bienestar de los trabajadores.",
+                "Ser en el 2030 la empresa lider en integracion de servicios de ingenieria y consultoria de seguridad laboral, reconocida por su innovacion, confiabilidad y compromiso con la vida.",
+                Arrays.asList("Seguridad y Salud en el Trabajo", "Integridad", "Calidad Excepcional", "Sostenibilidad", "Compromiso")
+        );
+    }
+
+    // 3. GET /api/datos-legales
+    public DatosLegalesDTO getDatosLegales() {
+        return new DatosLegalesDTO(
+                "901.458.322-1",
+                "Calle 100 # 15-30, Oficina 502, Bogota, Colombia"
+        );
+    }
+
+    @Transactional
+    public void crearContacto(ContactoRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("La solicitud de contacto no puede ser nula");
+        }
+
+        String nombre = limpiarTexto(request.getNombre());
+        String correo = limpiarTexto(request.getCorreo());
+        String mensaje = limpiarTexto(request.getMensaje());
+        String empresa = limpiarTexto(request.getEmpresa());
+        String telefono = limpiarTexto(request.getTelefono());
+
+        if (nombre == null || nombre.isEmpty()) {
+            throw new IllegalArgumentException("El nombre es requerido");
+        }
+        if ((correo == null || correo.isEmpty()) && (telefono == null || telefono.isEmpty())) {
+            throw new IllegalArgumentException("Se requiere correo o teléfono");
+        }
+        if (mensaje == null || mensaje.isEmpty()) {
+            throw new IllegalArgumentException("El mensaje es requerido");
+        }
+        if (contarEnlaces(mensaje) > 2) {
+            throw new IllegalArgumentException("El mensaje no puede contener mas de 2 enlaces");
+        }
+        if (!Boolean.TRUE.equals(request.getAceptaPolitica())) {
+            throw new IllegalArgumentException("Debes aceptar la política de tratamiento de datos.");
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        String normalizedEmail = correo == null ? null : correo.toLowerCase(Locale.ROOT);
+        if (normalizedEmail != null) {
+            emailSubmissionLockService.lockByEmail(normalizedEmail);
+            LocalDateTime lastContact = solicitudContactoRepository
+                    .findTopByCorreoOrderByFechaDesc(normalizedEmail)
+                    .map(SolicitudContacto::getFecha)
+                    .orElse(null);
+            if (lastContact != null && lastContact.plusMinutes(CONTACT_COOLDOWN_MINUTES).isAfter(now)) {
+                throw new TooManyRequestsException(
+                        "Ya recibimos una solicitud con este correo. Intenta nuevamente en 30 minutos.");
+            }
+        }
+
+        String tipoServicio = request.getTipoServicio() == null || request.getTipoServicio().trim().isEmpty()
+                ? "GENERAL"
+                : request.getTipoServicio().trim().toUpperCase(Locale.ROOT);
+        String nivelRiesgoSst = mapTipoServicioToNivelRiesgo(tipoServicio);
+
+        SolicitudContacto solicitud = new SolicitudContacto();
+        solicitud.setNombre(nombre);
+        solicitud.setEmpresa(empresa);
+        solicitud.setCorreo(normalizedEmail);
+        solicitud.setTelefono(telefono);
+        solicitud.setTipoServicio(tipoServicio);
+        solicitud.setNivelRiesgoSst(nivelRiesgoSst);
+        solicitud.setMensaje(mensaje);
+        solicitud.setFecha(now);
+        solicitud.setAceptaPolitica(true);
+        solicitud.setVersionPolitica(policyVersion);
+        solicitud.setFechaConsentimiento(now);
+        solicitudContactoRepository.save(solicitud);
+    }
+
+    // 5. POST /api/chat
+    @Transactional(noRollbackFor = ChatProviderUnavailableException.class)
+    public ChatResponse responderChat(ChatRequest request) {
+        if (request == null || request.getPregunta() == null || request.getPregunta().trim().isEmpty()) {
+            throw new IllegalArgumentException("La pregunta es requerida");
+        }
+
+        String pregunta = request.getPregunta().trim();
+        if (geminiEnabled && !Boolean.TRUE.equals(request.getAceptaEnvioProveedor())) {
+            throw new ChatConsentRequiredException();
+        }
+
+        LocalDateTime timestamp = LocalDateTime.now();
+
+        LogChat logChat = new LogChat();
+        logChat.setSessionId(UUID.randomUUID().toString());
+        logChat.setPregunta(pregunta);
+        logChat.setFecha(timestamp);
+        boolean aceptaEnvioProveedor = geminiEnabled
+                && Boolean.TRUE.equals(request.getAceptaEnvioProveedor());
+        logChat.setAceptaEnvioProveedor(aceptaEnvioProveedor);
+        if (aceptaEnvioProveedor) {
+            logChat.setVersionPolitica(policyVersion);
+            logChat.setFechaConsentimiento(timestamp);
+        }
+
+        String respuesta;
+        try {
+            respuesta = chatEngine.responder(pregunta);
+        } catch (ChatProviderUnavailableException exception) {
+            logChat.setRespuesta("No fue posible generar una respuesta con el asistente.");
+            logChatRepository.save(logChat);
+            throw exception;
+        }
+
+        logChat.setRespuesta(respuesta);
+        logChatRepository.save(logChat);
+
+        return new ChatResponse(pregunta, respuesta, timestamp);
+    }
+
+    // 7. POST /api/obras/seguimiento
+    @Transactional
+    public SeguimientoObraDTO getSeguimientoProyecto(String codigo) {
+        Obra obra = findTrackedWork(codigo);
+        if (obra.getCodigoCifrado() == null) {
+            obraRepository.storeRecoveredTrackingCode(obra.getId(), obra.getCodigoHash(),
+                    trackingCodeService.encrypt(codigo, obra.getCodigoHash()));
+        }
+
+        List<SeguimientoHitoDTO> hitos = obra.getHitos().stream()
+                .map(hito -> new SeguimientoHitoDTO(
+                          hito.nombre(), hito.descripcion(),
+                          hito.fechaObjetivo(), hito.completado()))
+                .toList();
+
+        SeguimientoObraDTO seguimiento = new SeguimientoObraDTO(
+                  obra.getNombreObra(), obra.getPorcentajeAvance(), hitos,
+                  obra.getFotos().stream().map(foto -> new FotoObraDTO(
+                          foto.id(), foto.nombre(), "/api/obras/seguimiento/fotos/" + foto.id(),
+                          foto.fecha(), foto.descripcion())).toList());
+        seguimiento.setDocumentos(documentos.listar(obra.getId()));
+        return seguimiento;
+    }
+
+    public byte[] getDocumento(String codigo, long id) {
+        return documentos.leer(findTrackedWork(codigo).getId(), id);
+    }
+
+    public byte[] getSeguimientoFoto(String codigo, Long fotoId) {
+        Obra obra = findTrackedWork(codigo);
+        obra.buscarFoto(fotoId);
+        return fotosObraService.obtener(obra.getId(), fotoId);
+    }
+
+    private Obra findTrackedWork(String codigo) {
+        String candidate = codigo == null ? "" : codigo.substring(0, Math.min(codigo.length(), 128));
+        String codeHash = trackingCodeService.hash(candidate);
+        Optional<Obra> found = obraRepository.findByCodigoHashWithHitos(codeHash);
+        boolean codeMatches = trackingCodeService.matches(
+                candidate, found.map(Obra::getCodigoHash).orElse(DUMMY_TRACKING_HASH));
+        boolean legacyCode = found.map(Obra::isCodigoLegacy).orElse(false);
+        boolean secureFormat = !legacyCode && TRACKING_CODE_PATTERN.matcher(candidate).matches();
+        boolean legacyFormat = legacyCode && legacyTrackingCodesEnabled
+                && LEGACY_TRACKING_CODE_PATTERN.matcher(candidate).matches();
+        if (found.isEmpty() || (!secureFormat && !legacyFormat) || !codeMatches) {
+            throw new ResourceNotFoundException("No se encontró el proyecto solicitado.");
+        }
+        return found.get();
+    }
+
+    private String mapTipoServicioToNivelRiesgo(String tipoServicio) {
+        if (tipoServicio == null) {
+            return "BAJO";
+        }
+        String normalized = tipoServicio.trim().toUpperCase(Locale.ROOT);
+        if (normalized.contains("SST") || normalized.contains("SEGURIDAD") || normalized.contains("SALUD")) {
+            return "MEDIO";
+        }
+        if (normalized.contains("CIVIL") || normalized.contains("ESTRUCTURA") || normalized.contains("OBRA")) {
+            return "ALTO";
+        }
+        return "BAJO";
+    }
+
+    private String limpiarTexto(String texto) {
+        if (texto == null) {
+            return null;
+        }
+        return Normalizer.normalize(texto, Normalizer.Form.NFC)
+                .replaceAll("[\\p{Cntrl}&&[^\\n]]", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    private int contarEnlaces(String texto) {
+        Matcher matcher = CONTACT_LINK_PATTERN.matcher(texto);
+        int count = 0;
+        while (matcher.find()) {
+            count++;
+        }
+        return count;
+    }
+
+}

@@ -1,0 +1,163 @@
+package com.gyg.backend.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.gyg.backend.service.SupabaseAuth;
+import com.gyg.backend.service.VerifiedSessionService;
+import com.gyg.backend.service.UsuarioService;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.env.Environment;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+@Configuration
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(
+            HttpSecurity http,
+            SupabaseAuth supabaseAuth,
+            UsuarioService usuarioService,
+            VerifiedSessionService verifiedSessionService,
+            ObjectMapper objectMapper,
+            @Value("${app.captcha.enabled:true}") boolean captchaEnabled,
+            @Value("${app.swagger.public:false}") boolean swaggerPublic) throws Exception {
+        SupabaseTokenFilter supabaseTokenFilter =
+                new SupabaseTokenFilter(supabaseAuth, usuarioService);
+        VerifiedSessionFilter verifiedSessionFilter =
+                new VerifiedSessionFilter(verifiedSessionService, objectMapper, captchaEnabled);
+
+        http
+                .csrf(csrf -> csrf.disable())
+                .cors(Customizer.withDefaults())
+                .headers(headers -> headers
+                        .referrerPolicy(referrer -> referrer
+                                .policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.NO_REFERRER))
+                        .httpStrictTransportSecurity(hsts -> hsts
+                                .includeSubDomains(true)
+                                .maxAgeInSeconds(31536000))
+                        .addHeaderWriter((request, response) -> {
+                            response.setHeader("Permissions-Policy",
+                                    "camera=(), microphone=(), geolocation=()");
+                            if (request.getRequestURI().startsWith("/api/")) {
+                                response.setHeader("Content-Security-Policy",
+                                        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+                            }
+                        }))
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .exceptionHandling(exceptions -> exceptions
+                        .authenticationEntryPoint((request, response, exception) ->
+                                writeError(request, response, objectMapper, HttpStatus.UNAUTHORIZED,
+                                        "No autorizado", "Debes autenticarte para acceder a este recurso."))
+                        .accessDeniedHandler((request, response, exception) ->
+                                writeError(request, response, objectMapper, HttpStatus.FORBIDDEN,
+                                        "Acceso denegado", "No tienes permisos para acceder a este recurso.")))
+                .authorizeHttpRequests(authorize -> {
+                    authorize.requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
+                            .requestMatchers("/error", "/api/inducciones/**").permitAll();
+                    if (swaggerPublic) {
+                        authorize.requestMatchers(
+                                "/swagger-ui.html", "/swagger-ui/**", "/v3/api-docs", "/v3/api-docs/**")
+                                .permitAll();
+                    } else {
+                        authorize.requestMatchers(
+                                "/swagger-ui.html", "/swagger-ui/**", "/v3/api-docs", "/v3/api-docs/**")
+                                .authenticated();
+                    }
+                    authorize.requestMatchers(
+                                    HttpMethod.POST,
+                                    "/api/auth/captcha/verify",
+                                    "/api/auth/password-reset")
+                            .permitAll()
+                            .requestMatchers("/api/auth/**").authenticated()
+                            .requestMatchers(HttpMethod.POST, "/api/obras/seguimiento/**").permitAll()
+                            .requestMatchers(HttpMethod.POST, "/api/cotizaciones/vista-previa", "/api/cotizaciones/pdf").permitAll()
+                    .requestMatchers("/api/panel/obras/clientes").hasRole("ADMIN")
+                    .requestMatchers("/api/panel/**").hasAnyRole("ADMIN", "INGENIERO")
+                    .requestMatchers("/api/admin/consultas-chat").hasRole("ADMIN")
+                    .requestMatchers("/api/admin/autorizados/**", "/api/admin/usuarios/**")
+                            .hasRole("ADMIN")
+                            .requestMatchers("/api/admin/**").hasAnyRole("ADMIN", "INGENIERO")
+                            .requestMatchers(HttpMethod.GET, "/api/**").permitAll()
+                            .requestMatchers(HttpMethod.POST, "/api/contacto", "/api/chat", "/api/newsletter")
+                            .permitAll()
+                            .anyRequest().authenticated();
+                })
+                .addFilterBefore(supabaseTokenFilter, UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(verifiedSessionFilter, SupabaseTokenFilter.class)
+                .formLogin(form -> form.disable())
+                .httpBasic(basic -> basic.disable());
+
+        return http.build();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource(
+            Environment environment,
+            @Value("${app.cors.allowed-origins:}") String configuredOrigins,
+            @Value("${app.cors.dev-origins:http://localhost:*,http://127.0.0.1:*}") String devOrigins) {
+        List<String> allowedOrigins = new ArrayList<>(Arrays.stream(configuredOrigins.split(","))
+                .map(String::trim)
+                .filter(origin -> !origin.isEmpty())
+                .toList());
+        if (environment.acceptsProfiles(org.springframework.core.env.Profiles.of("dev"))) {
+            Arrays.stream(devOrigins.split(","))
+                    .map(String::trim)
+                    .filter(origin -> !origin.isEmpty())
+                    .filter(origin -> !allowedOrigins.contains(origin))
+                    .forEach(allowedOrigins::add);
+        }
+
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedOriginPatterns(allowedOrigins);
+        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        configuration.setAllowedHeaders(List.of("Authorization", "Content-Type", "Accept", "If-Match", "X-Captcha-Token", "X-Induccion-Token"));
+        configuration.setAllowCredentials(false);
+        configuration.setMaxAge(Duration.ofSeconds(3600));
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
+    }
+
+    private static void writeError(
+            jakarta.servlet.http.HttpServletRequest request,
+            HttpServletResponse response,
+            ObjectMapper objectMapper,
+            HttpStatus status,
+            String error,
+            String message) throws IOException {
+        response.setStatus(status.value());
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        response.setCharacterEncoding("UTF-8");
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("timestamp", LocalDateTime.now());
+        body.put("status", status.value());
+        body.put("error", error);
+        body.put("message", message);
+        body.put("path", request.getRequestURI());
+        objectMapper.writeValue(response.getOutputStream(), body);
+    }
+}
